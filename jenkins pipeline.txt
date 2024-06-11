@@ -1,0 +1,261 @@
+def label = "mypod-${UUID.randomUUID().toString()}"
+def serviceaccount = "jenkins-admin"
+def AllowedPattern() {
+        sh '''
+        git secrets --add --allowed 'library/vars/gitSecretsAllowedPatterns.groovy'
+        git secrets --add --allowed 'library/vars/gitSecretsNonAllowedPatterns.groovy'
+        git secrets --add --allowed --literal 'ex@mplepassword'
+		git secrets --add --allowed --literal 'sooper secret'
+		git secrets --add --allowed --literal 'process.env.MYSQL_ENV_MYSQL_ROOT_PASSWORD'
+        git secrets --add --allowed '(passwordVariable):\\s*.+]'
+        git secrets --add --allowed '.*\\$\\{.+\\}'
+        git secrets --add --allowed '(credentialsId):\\s*.+'
+        git secrets --add --allowed --literal '$PASSWORD'
+        git secrets --add --allowed --literal 'git-secrets'
+        git secrets --add --allowed --literal 'secretName: 'kube-config''
+        git secrets --add --allowed --literal 'secretVolume'
+        git secrets --add --allowed 'git_scan_nonallowed.groovy'
+        git secrets --add --allowed 'git_scan_allowed.groovy'
+        git secrets --add --allowed '#.+'
+        git secrets --add --allowed 'README.md'
+		'''
+}
+def nonAllowedPattern() {
+        sh '''
+        git secrets --add '[^a-zA-Z\\s+]password\\s*(=|:)\\s*.+',
+		git secrets --add 'credential\\s*(=|:)\\s*.+'
+		git secrets --add '^key\\s*(=|:)\\s*.+'
+		git secrets --add 'userid\\s*(=|:)\\s*.+'
+		git secrets --add 'access\\s*(=|:)\\s*.+'
+		git secrets --add 'secret\\s*(=|:)\\s*.+'
+		git secrets --add 'https?:[a-zA-Z0-9!@#$&()\\-`.+,/\"\\S]+:[a-zA-Z0-9!@#$&()\\-`.+,/\"\\S]+@[a-zA-Z0-9\\-`.+,\\S]+'
+		
+		'''
+}
+
+podTemplate(label: label, serviceAccount: serviceaccount,
+    containers: [
+    containerTemplate(name: 'kics', image: 'checkmarx/kics:latest', ttyEnabled: true, command: 'cat'),
+        containerTemplate(name: 'maven', image: 'shanghaiqe/maven-openjdk11-git:latest', ttyEnabled: true, command: 'cat', resourceRequestCpu: '150m', resourceLimitCpu: '1000m', resourceRequestMemory: '100Mi', resourceLimitMemory: '5000Mi'),
+        containerTemplate(name: 'git-secrets', image: 'localhost:32121/root/docker_registry/aiindevops.azurecr.io/git-secrets:0.1', ttyEnabled: true, alwaysPullImage: true, command: 'cat'),
+        containerTemplate(name: 'snyk', image: 'snyk/snyk:python-3.9', ttyEnabled: true, command: 'cat')],
+                     imagePullSecrets: [ 'gcrcred' ]
+)
+
+{
+ currentBuild.description = "$Template_Type"
+    node(label)
+{
+stage('Git checkout') {
+   		git branch: "Feature", url: "https://innersource.accenture.com/scm/ethan/ct_demodocrepo.git" ,credentialsId: "nithinAPI"    
+}
+
+try{
+    stage('Git Secrets') {
+        container('git-secrets') {
+            nonAllowedPattern()
+            AllowedPattern()
+            echo "Git secrets scan strat"
+            sh "git secrets --scan"
+            sh "echo No Secrets Exposed >> gitsecrets.txt"
+        }
+        catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+                        sh "exit 0"
+        } 
+    }
+}
+catch(Exception e){
+    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+        sh "echo Secrets Exposed >> gitsecrets.txt"
+        sh "exit 1"
+    }
+} 
+
+if("$Template_Type" == "App" || "$Template_Type" == "APP"){
+    
+    stage('Fortify code scan'){
+        sh "sleep 1"
+    }
+try{
+        stage('PackageScan-Snyk') {
+        container('snyk')    
+      {
+        sh '''
+                 snyk auth <auth token for snyk>
+                 pip install -r requirements.txt
+                 snyk test --json-file-output=SnykVulnerability.json
+                 '''
+                 echo "No Vulnerabilites found"
+				}   
+        		}
+            }
+             catch (Exception e){
+                echo "Vulnrabilities found"
+             }
+			 
+		stage('Push Report'){
+          container('maven'){
+        withCredentials([usernamePassword(credentialsId: 'NEXUS', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+		    {
+              sh '''
+                curl --upload-file Fortify_SAST.pdf -u $USERNAME:$PASSWORD -v http://nexus.ethan.svc.cluster.local:8083/nexus/repository/Contribute_Asset_Checks/${JOB_NAME}/$BUILD_ID/$Template_Type/
+                curl --upload-file SnykVulnerability.json -u $USERNAME:$PASSWORD -v http://nexus.ethan.svc.cluster.local:8083/nexus/repository/Contribute_Asset_Checks/${JOB_NAME}/$BUILD_ID/$Template_Type//
+				 '''
+			}
+            } 
+	}
+
+}
+if("$Template_Type" == "Infra" || "$Template_Type" == "INFRA"){
+    try{
+    stage('Infra code scan -KICS') {
+    
+    container('kics')
+    {
+     sh'''
+      kics scan -p ${WORKSPACE} --output-path results --report-formats "json"
+      '''
+}
+ catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
+                        sh "exit 0"
+                     }
+}
+}
+catch(Exception e){
+    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        sh "exit 1"
+                        }
+}
+
+
+stage('Push report'){
+     container('maven'){
+        withCredentials([usernamePassword(credentialsId: 'NEXUS', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+		    {
+              sh '''
+              ls
+                cd "$PWD"/results
+                ls
+                mv results.json kicsreport.json
+                curl --upload-file kicsreport.json -u $USERNAME:$PASSWORD -v http://nexus.ethan.svc.cluster.local:8083/nexus/repository/Contribute_Asset_Checks/${JOB_NAME}/$BUILD_ID/$Template_Type/
+				 '''
+			}
+            }
+}
+}
+stage('Readme content verification'){
+
+    sh'''
+    #!/bin/bash
+    if [ -e "$filename" ]; then
+        echo "$filename file is exisiting" >> log.txt
+    else
+        echo "$filename is not exisiting" >> log.txt
+    fi
+    
+    sed -i '/^s*$/d' "$filename"
+    cat $filename
+    
+    c=`cat $filename | wc -c`
+    w=`cat $filename | wc -w`
+    l=`grep -c "." $filename`
+    echo Number of characters in $filename is $c >> log.txt
+    echo Number of words in $filename is $w >> log.txt
+    echo Number of lines in $filename is $l >> log.txt
+    
+    while read line; do
+        echo "Line: $line"
+        line_length=${#line}
+    done < readme.md
+    
+    max_size=1000 # Replace with the desired maximum file size in bytes
+    file_size=$(stat -c %s "$filename")  # Get the current file size in bytes
+    if [ "$file_size" -gt "$max_size" ]; then
+        echo "File size exceeded the maximum limit. Truncating file" >> log.txt
+        truncate -s "$max_size" "$filename"
+        echo "File truncated to $max_size bytes." >> log.txt
+    else
+        echo "File size is within the limit." >> log.txt
+    fi
+    
+    cat log.txt
+    
+    '''
+ script {
+            
+                    def expectedContents = [
+                                    "About",
+                                    "Overview",
+                                    "Features",
+                                    "Documentation"
+                                ]
+     
+                    def fileContents = sh(returnStdout: true, script: 'grep -v "^$" $filename').trim().split('\n')
+                    sh "echo The '$filename' contents are: '$fileContents' >> log.txt" 
+                  
+                     // Filtered array with only About and Overview
+                    def filteredArray = fileContents.findAll { line -> line.contains('About') || line.contains('Overview') || line.contains('Features') || line.contains('Documentation') }
+                    sh "echo The Headings found in '$filename' are : '$filteredArray' >> log.txt"
+                    
+                    for(int i=0; i<expectedContents.size(); i++){
+                    if(expectedContents[i] == filteredArray[i]){
+                        sh "echo '${expectedContents[i]}' is present >> log.txt"
+                    }
+                    else{
+                        sh "echo '${expectedContents[i]}' is not present >> log.txt"
+                    }
+                    }
+                    
+                    def aboutDes = fileContents[1]
+                    def aboutDes_len = aboutDes.length()
+                    sh "echo The length of About description is '$aboutDes_len' >> log.txt"
+                    
+                    if(aboutDes_len > 10 || aboutDes_len < 50){
+                        sh "echo About description is in expected length >> log.txt"
+                    }
+                    else{
+                        sh "echo About description is not in expected length >> log.txt"
+                    }
+                    def overviewDes = fileContents[3]
+                    def overviewDes_len = overviewDes.length()
+                    sh "echo The length of Overview description is '$overviewDes_len' >> log.txt"
+                    if(overviewDes_len > 150 || overviewDes_len < 300){
+                        sh "echo Overview description is in expected length >> log.txt"
+                    }
+                    else{
+                        sh "echo Overview description is not in expected length >> log.txt"
+                    }
+                    sh "cat log.txt"
+					 }
+}
+
+
+stage('Readme output push report'){
+     container('maven'){
+        withCredentials([usernamePassword(credentialsId: 'NEXUS', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+		    {
+              sh '''
+              ls
+              cat gitsecrets.txt log.txt > logs.txt
+              curl --upload-file logs.txt -u $USERNAME:$PASSWORD -v http://nexus.ethan.svc.cluster.local:8083/nexus/repository/Contribute_Asset_Checks/${JOB_NAME}/$BUILD_ID/$Template_Type/
+			  '''
+			}
+            }
+}
+stage('Quality gate for documentation'){
+        timeout(time: 1200, unit: 'SECONDS')
+	{
+    user_input = input(
+    message: 'Please analyze the content of Readme.',
+    parameters: [
+    [$class: 'ChoiceParameterDefinition',
+    choices: ['YES','NO'],
+    name: 'Input']
+    ])
+    echo "The answer is: ${user_input}"
+	}
+}
+
+    
+}
+}

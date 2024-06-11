@@ -1,0 +1,71 @@
+def pvc_name="nodejs-pvc"
+def serviceaccount = "jenkins-admin"
+def pvclabel = "pvc-creation-pod"
+def cleanuplabel = "postbuild-cleanup-pod"
+def librarylabel = "built-in"
+def label = "mypod-${UUID.randomUUID().toString()}"
+def GIT_URL=env.GIT_URL 
+def GIT_CREDENTIAL_ID ='gitlab'
+def GCR_HUB_ACCOUNT = 'gitlab:8223'
+def GCR_HUB_ACCOUNT_NAME = 'root'
+def GCR_HUB_REPO_NAME="docker_registry"
+def DOCKER_IMAGE_NAME = 'demo'
+def ACR_HUB_ACCOUNT = 'aiindevops.azurecr.io'
+def IMAGE_TAG = "yc_${BUILD_ID}"
+def IMAGE_TAG_INPUT = "demo_${BUILD_ID}"
+def JOBNAME = "${JOB_NAME.split('/')[1]}"
+def K8S_DEPLOYMENT_NAME = 'kaniko_demo'
+def APP_NAME='demo_pro'
+def buildTool = "nodejs"
+def kubeaudit_threshold = "12000"
+env.threshold = "${params.DEPENDENCY_THRESHOLD}"
+def kaniko_image = "awskopsgen7backuprestore.continuoustestplatform.com/root/docker_registry/aiindevops.azurecr.io/kaniko:v1.7.0-debug"
+def GIT_BRANCH="master"
+println(GIT_BRANCH)
+
+podTemplate(label: label, serviceAccount: serviceaccount,
+		yaml: """
+        spec:
+          containers:
+          - name: kaniko
+            image: awskopsgen7backuprestore.continuoustestplatform.com/root/docker_registry/aiindevops.azurecr.io/kaniko:v1.7.0-debug
+            imagePullPolicy: IfNotPresent
+            command:
+            - /busybox/cat
+            tty: true
+            volumeMounts:
+            - name: my-secret
+              mountPath: /kaniko/.docker
+          imagePullSecrets:
+          - name: regcred2
+          volumes:
+          - name: my-secret
+            projected:
+              sources:
+              - secret:
+                  name: gitlabcred
+                  items:
+                    - key: .dockerconfigjson
+                      path: config.json
+
+    """
+)
+
+    {
+       node(label) {
+       stage('git checkout') {
+
+           git branch: 'main', credentialsId: 'gitlab', url: 'https://awskopsgen7backuprestore.continuoustestplatform.com/gitlab/gitlab-instance-d502c576/yctest.git'
+               
+        }
+		stage('create image'){
+			container(name: 'kaniko'){
+                sh '''
+                set -x
+		      /kaniko/executor --context `pwd` --insecure-pull --skip-tls-verify-pull --insecure --skip-tls-verify --build-arg namespace=ethan --destination '''+GCR_HUB_ACCOUNT+'''/'''+GCR_HUB_ACCOUNT_NAME+'''/'''+GCR_HUB_REPO_NAME+'''/'''+DOCKER_IMAGE_NAME+''':'''+IMAGE_TAG+'''
+            ''' 
+			}                
+		}
+}
+}
+    

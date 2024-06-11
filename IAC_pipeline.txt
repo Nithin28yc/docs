@@ -1,0 +1,284 @@
+def serviceaccount = "jenkins-admin"
+podTemplate(label: label, serviceAccount: serviceaccount,
+    containers: [containerTemplate(name: 'terraform', image: 'hashicorp/terraform', ttyEnabled: true, command: 'cat'),
+                containerTemplate(name: 'maven', image: 'maven:3.3.9-jdk-8-alpine', ttyEnabled: true, command: 'cat'),
+                containerTemplate(name: 'git-secrets', image: 'aiindevops.azurecr.io/git-secrets:0.1', ttyEnabled: true, alwaysPullImage: true, command: 'cat'),
+                containerTemplate(name: 'pipenv', image: 'kennethreitz/pipenv:latest', ttyEnabled: true, alwaysPullImage: true, command: 'cat'),
+        containerTemplate(name: 'kubectl', image: 'localhost:32121/root/docker_registry/aiindevops.azurecr.io/docker-kubectl:19.03-alpine', ttyEnabled: true, command: 'cat',
+               volumes: [secretVolume(secretName: 'kube-config', mountPath: '/root/.kube')]),
+               containerTemplate(name: 'ubuntu', image: 'ubuntu', ttyEnabled: true, command: 'cat'),
+    containerTemplate(name: 'docker', image: 'docker:1.11', ttyEnabled: true, command: 'cat')],
+    volumes: [hostPathVolume(hostPath: '/var/run/docker.sock', mountPath: '/var/run/docker.sock')],
+    imagePullSecrets: [ 'regcred' ]
+)
+
+{
+        node(label)
+{
+        def user_input="YES"
+        currentBuild.description = "$CloudType"
+stage('git checkout')
+        {
+        git branch: "codeModify", url: "http://gitlab.ethan.svc.cluster.local:8084/gitlab/root/iac.git", credentialsId: "gitlab"
+        }
+
+stage('git secrets')
+        {
+        def Nap = load "${WORKSPACE}/git_scan_nonallowed.groovy"
+    def Ap = load "${WORKSPACE}/git_scan_allowed.groovy"
+        container('git-secrets')
+        {
+    Nap.nonAllowedPattern()
+    Ap.AllowedPattern()
+        sh 'git secrets --scan'
+    }
+        }
+
+stage('CheckOV-Terraform')
+        {
+        container('pipenv')
+        {
+        //sh "cd Terraform"
+    sh "pipenv install"
+    sh "pipenv run pip install checkov"
+    sh "pipenv run checkov --directory Terraform/${CloudType} -o junitxml &gt; result.xml || true"
+    junit "result.xml"
+    }
+        }
+
+stage('Quality gate')
+        {
+    timeout(time: 1200, unit: 'SECONDS')
+        {
+    user_input = input(
+    message: 'Please analyze the Terraform checkOV report.',
+    parameters: [
+    [$class: 'ChoiceParameterDefinition',
+    choices: ['YES','NO'],
+    name: 'Input',
+    description: 'If you want to rollback to previous deployment, select "yes". otherwise select "NO" to complete the prod deployment.']
+    ])
+    echo "The answer is: ${user_input}"
+        }
+        }
+
+if ("$CloudType" == "Terraform_AWS")
+{
+stage('Terraform')
+        {
+    container('terraform')
+        {
+    withAWS(credentials: 'ansible')
+        {
+        sh '''
+        cd Terraform
+        cd ${CloudType}
+        ls
+        terraform init
+        terraform plan
+        terraform apply -auto-approve
+        terraform output --json &gt; output.json
+        cat output.json
+        '''
+        }
+        }
+        }
+stage('Nexus Uploader')
+    {
+    container('maven')
+    {
+    withCredentials([usernamePassword(credentialsId: 'NEXUS', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        {
+    sh '''
+    cd Terraform
+    cd ${CloudType}
+    curl --upload-file output.json -u $USERNAME:$PASSWORD -v http://nexus.ethan.svc.cluster.local:8083/nexus/repository/IaC/${JOB_NAME}/$BUILD_ID/
+    '''
+    }
+    }
+    }
+}
+
+else if ("$CloudType" == "Terraform_Azure")
+{
+stage('Terraform')
+        {
+    container('terraform')
+        {
+    withCredentials([azureServicePrincipal(credentialsId: 'Azure_YC',  subscriptionIdVariable: 'AZURE_SUBSCRIPTION_ID',
+            clientIdVariable: 'AZURE_CLIENT_ID',
+            clientSecretVariable: 'AZURE_SECRET',
+            tenantIdVariable: 'AZURE_TENANT')])
+        {
+        sh '''
+        cd Terraform
+        cd ${CloudType}
+        ls
+        sed -i 's/SUBSCRIPTION_ID/'$AZURE_SUBSCRIPTION_ID'/g' variables.tf
+        sed -i 's/CLIENT_ID/'$AZURE_CLIENT_ID'/g' variables.tf
+        sed -i 's/CLIENT_SECRET/'$AZURE_SECRET'/g' variables.tf
+        sed -i 's/TENANT_ID/'$AZURE_TENANT'/g' variables.tf
+        terraform init
+        terraform plan
+        terraform apply -auto-approve
+        terraform output --json &gt; output.json
+        cat output.json
+        '''
+    }
+    }
+        }
+
+stage('Nexus Uploader')
+    {
+    container('maven')
+    {
+    withCredentials([usernamePassword(credentialsId: 'NEXUS', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        {
+    sh '''
+    cd Terraform
+    cd ${CloudType}
+    curl --upload-file output.json -u $USERNAME:$PASSWORD -v http://nexus.ethan.svc.cluster.local:8083/nexus/repository/IaC/${JOB_NAME}/$BUILD_ID/
+    '''
+    }
+    }
+    }
+}
+
+else if("$CloudType" == "Terraform_GCP")
+{
+stage('Terraform')
+        {
+    container('terraform')
+        {
+    withCredentials([file(credentialsId:'GCP_YC', variable: 'GCP_key')])
+        {
+        sh '''
+        cd Terraform
+        cd ${CloudType}
+        ls
+    mv $GCP_key cred.json
+    ls
+        terraform init
+        terraform plan
+        terraform apply -auto-approve
+        terraform output --json &gt; output.json
+        cat output.json
+        '''
+    }
+    }
+        }
+
+stage('Nexus Uploader')
+    {
+    container('maven')
+    {
+    withCredentials([usernamePassword(credentialsId: 'NEXUS', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        {
+    sh '''
+    cd Terraform
+    cd ${CloudType}
+    curl --upload-file output.json -u $USERNAME:$PASSWORD -v http://nexus.ethan.svc.cluster.local:8083/nexus/repository/IaC/${JOB_NAME}/$BUILD_ID/
+    '''
+    }
+    }
+    }
+}
+
+if ("$ChefInspec_Cloud" == "chef-inspec-aws")
+{
+stage('Chef-inspec Input Nexus Downloader')
+        {
+    container('maven')
+        {
+    withCredentials([usernamePassword(credentialsId: 'NEXUS', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        {
+    sh '''
+    cd Chef-Inspec
+        cd Terraform
+    cd ${ChefInspec_Cloud}
+    cd ${Profilename}
+    cd files
+        curl -u $USERNAME:$PASSWORD -O "http://nexus.ethan.svc.cluster.local:8083/nexus/repository/IaC/${JOB_NAME}/$BUILD_ID/output.json"
+    '''
+    }
+    }
+    }
+
+stage ("Chef-inspec")
+        {
+        container('ubuntu')
+        {
+        withAWS(credentials: 'ansible', region: 'us-east-2')
+        {
+        sh '''
+        ls
+        cd Chef-Inspec
+        cd Terraform
+        cd ${ChefInspec_Cloud}
+        apt update
+        apt install curl -y
+        curl https://omnitruck.chef.io/install.sh | bash -s -- -P inspec
+        dpkg -i $(pwd)/inspec_4.52.9-1_amd64.deb
+        inspec
+        inspec --chef-license=accept
+        inspec exec ${Profilename} -t aws:// --reporter yaml:chef-inspec.yaml
+        cat chef-inspec.yaml
+        '''
+        }
+        }
+    }
+
+stage('Chef-inspec Output Nexus Uploader')
+        {
+    container('maven')
+        {
+    withCredentials([usernamePassword(credentialsId: 'NEXUS', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')])
+        {
+    sh '''
+    cd Chef-Inspec
+        cd Terraform
+    cd ${ChefInspec_Cloud}
+    curl --upload-file chef-inspec.yaml -u $USERNAME:$PASSWORD -v http://nexus.ethan.svc.cluster.local:8083/nexus/repository/IaC/${JOB_NAME}/$BUILD_ID/
+    '''
+    }
+    }
+    }
+}
+
+else if ("$ChefInspec_Cloud" == "chef-inspec-azure")
+{
+stage('Chef-inspec Input Nexus Downloader')
+        {
+    echo "hello"
+    }
+
+stage ("Chef-inspec")
+        {
+        echo "hello"
+    }
+
+stage('Chef-inspec Output Nexus Uploader')
+        {
+        echo "hello"
+    }
+}
+
+else if("$ChefInspec_Cloud" == "chef-inspec-gcp")
+{
+stage('Chef-inspec Input Nexus Downloader')
+        {
+    echo "hello"
+    }
+
+stage ("Chef-inspec")
+        {
+        echo "hello"
+    }
+
+stage('Chef-inspec Output Nexus Uploader')
+        {
+        echo "hello"
+    }
+}
+
+}

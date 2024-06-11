@@ -1,0 +1,169 @@
+def label = "mypod-${UUID.randomUUID().toString()}"
+def serviceaccount = "jenkins-admin"
+podTemplate(label: label, serviceAccount: serviceaccount, 
+containers: [containerTemplate(name: 'python', image: 'localhost:32121/root/docker_registry/aiindevops.azurecr.io/python', ttyEnabled: true, command: 'cat'),
+containerTemplate(name: 'git-secrets', image: 'localhost:32121/root/docker_registry/aiindevops.azurecr.io/git-secrets:0.1', ttyEnabled: true, alwaysPullImage: true, command: 'cat'),
+containerTemplate(name: 'maven', image: 'localhost:32121/root/docker_registry/aiindevops.azurecr.io/maven:3.3.9-jdk-8-alpine', ttyEnabled: true, command: 'cat',resourceRequestCpu: '150m',resourceLimitCpu: '4000m',resourceRequestMemory: '100Mi',resourceLimitMemory: '7000Mi'),
+containerTemplate(name: 'kubeaudit', image: 'localhost:32121/root/docker_registry/aiindevops.azurecr.io/kube-audit:0.1', ttyEnabled: true, alwaysPullImage: true, command: 'cat'),
+containerTemplate(name: 'helm', image: 'localhost:32121/root/docker_registry/aiindevops.azurecr.io/lachlanevenson', command: 'cat', ttyEnabled: true),
+containerTemplate(name: 'kubectl', image: 'localhost:32121/root/docker_registry/aiindevops.azurecr.io/docker-kubectl:19.03-alpine', ttyEnabled: true, command: 'cat',
+	   volumes: [secretVolume(secretName: 'kube-config', mountPath: '/root/.kube')]),
+containerTemplate(name: 'zap', image: 'localhost:32121/root/docker_registry/aiindevops.azurecr.io/zap:v2', privileged: true, ttyEnabled: true, command: 'cat'),
+containerTemplate(name: 'ubuntu', image: 'ubuntu', ttyEnabled: true, command: 'cat',),
+containerTemplate(name: 'docker', image: 'docker:20.10', ttyEnabled: true, command: 'cat',)],
+		imagePullSecrets: ['gcrcred']
+) 
+
+{
+	node(label)
+{
+	def user_input="YES"
+	currentBuild.description = "$CloudType"
+stage ("git checkout")
+	{
+	git branch: "master", url: "http://gitlab.ethan.svc.cluster.local:8084/gitlab/root/iac.git", credentialsId: "gitlab"
+	}
+	
+stage('git secrets')
+	{
+    def Nap = load "${WORKSPACE}/git_scan_nonallowed.groovy"
+	def Ap = load "${WORKSPACE}/git_scan_allowed.groovy"
+	container('git-secrets')
+	{
+    Nap.nonAllowedPattern()
+    Ap.AllowedPattern()	
+	sh 'git secrets --scan'
+    }
+	}
+	
+stage ("ansible-lint")
+	{
+    container('python')
+    {
+	container('ubuntu')
+	{
+	try
+	{
+	sh '''
+	cd Ansible
+	apt update 
+	apt install python3-pip -y
+	pip3 install "ansible-lint[community,yamllint]"
+	ansible-lint --version
+	ansible-lint ${CloudType} 
+	'''
+	}
+	catch(Exception e)
+	{
+	sh 'echo e'
+	}
+	}
+	}
+	}
+
+stage('Quality gate')
+	{
+    timeout(time: 1200, unit: 'SECONDS')
+	{
+	user_input = input(
+    message: 'Please analyze the Ansible report.',
+    parameters: [
+    [$class: 'ChoiceParameterDefinition',
+    choices: ['YES','NO'],
+    name: 'Input',
+    description: 'If you want to rollback to previous deployment, select "yes". otherwise select "NO" to complete the prod deployment.']
+    ])
+	echo "The answer is: ${user_input}"
+    }
+    }
+	
+if ("$CloudType" == "Ansible_AWS.yml")
+{
+stage ("ansible-playbook")
+	{
+	container('python')
+	{
+	container('ubuntu')
+	{
+	sh '''
+	apt update 
+	apt install ansible -y
+	apt install python3-pip -y
+	pip install boto boto3 
+	'''
+	withAWS(credentials: 'ansible', region: 'ap-southeast-2')
+	{
+	sh '''
+	cd Ansible
+	ansible-playbook ${CloudType} 
+	'''
+	}
+	}
+	}
+	}
+}
+
+else if ("$CloudType" == "Ansible_Azure.yml")
+{
+stage ("ansible-playbook")
+	{
+	container('python')
+	{
+	container('ubuntu')
+	{
+	sh '''
+	apt update 
+	apt install -y python3-pip
+	pip3 install ansible[azure]
+	ansible-galaxy collection install azure.azcollection
+	apt install wget -y
+	wget https://raw.githubusercontent.com/ansible-collections/azure/dev/requirements-azure.txt
+	pip3 install -r requirements-azure.txt
+    '''
+
+	withCredentials([azureServicePrincipal(credentialsId: 'Azure_YC',
+                                    subscriptionIdVariable: 'AZURE_SUBSCRIPTION_ID',
+                                    clientIdVariable: 'AZURE_CLIENT_ID',
+                                    clientSecretVariable: 'AZURE_SECRET',
+                                    tenantIdVariable: 'AZURE_TENANT')])  
+    {
+    sh '''
+    cd Ansible
+	ansible-playbook ${CloudType} 
+	'''
+	}
+	}
+	}
+	}
+}
+else if ("$CloudType" == "Ansible_GCP.yml")
+{
+stage ("ansible-playbook")
+	{
+	container('python')
+	{
+	container('ubuntu')
+	{
+	sh '''
+		apt update 
+	    apt install software-properties-common -y
+	    apt install python3-pip -y
+	    add-apt-repository --yes --update ppa:ansible/ansible
+		apt install ansible -y
+		ansible-galaxy collection install google.cloud
+		pip install requests google-auth
+	'''
+	
+	withCredentials([file(credentialsId:'GCP_YC', variable: 'GCP_key')]) {
+	sh '''
+		cd Ansible
+	    sed -i 's/sample/${GCP_key}/g' Ansible_GCP.yml
+		ansible-playbook ${CloudType}
+		'''
+		}
+		}
+		}
+		}
+}
+}	
+}
